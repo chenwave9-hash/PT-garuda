@@ -1,0 +1,70 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and balance information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Unique user ID" },
+        "email": { "type": "string", "description": "User email" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "balance": { "type": "number", "description": "Current wallet balance" },
+        "role": { "type": "string", "enum": ["user", "admin"], "description": "User role" },
+        "isBlocked": { "type": "boolean", "description": "Whether the user is blocked" },
+        "photoURL": { "type": "string", "description": "User profile photo URL" }
+      },
+      "required": ["uid", "email", "balance", "role"]
+    },
+    "Investment": {
+      "title": "Investment",
+      "description": "Active investment plans for a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Investment ID" },
+        "uid": { "type": "string", "description": "User ID" },
+        "planName": { "type": "string", "description": "Name of the plan" },
+        "amount": { "type": "number", "description": "Invested amount" },
+        "dailyProfit": { "type": "number", "description": "Profit per day" },
+        "daysLeft": { "type": "number", "description": "Remaining days of investment" },
+        "totalDays": { "type": "number", "description": "Total duration in days" },
+        "status": { "type": "string", "enum": ["active", "completed"], "description": "Investment status" },
+        "lastProfitUpdate": { "type": "string", "format": "date-time", "description": "Last time profit was added" }
+      },
+      "required": ["uid", "planName", "amount", "dailyProfit", "daysLeft", "totalDays", "status"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Deposit and withdrawal requests",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Transaction ID" },
+        "uid": { "type": "string", "description": "User ID" },
+        "type": { "type": "string", "enum": ["deposit", "withdraw"], "description": "Transaction type" },
+        "amount": { "type": "number", "description": "Transaction amount" },
+        "fee": { "type": "number", "description": "Withdrawal fee (5%)" },
+        "netAmount": { "type": "number", "description": "Amount after fee" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"], "description": "Current status" },
+        "method": { "type": "string", "description": "Payment method (Bank/E-Wallet)" },
+        "accountName": { "type": "string", "description": "Name of Bank or E-Wallet" },
+        "accountNumber": { "type": "string", "description": "Account or Phone number" },
+        "proofURL": { "type": "string", "description": "URL or base64 of payment proof screenshot" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Time of request" }
+      },
+      "required": ["uid", "type", "amount", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profile documents"
+    },
+    "/investments/{investmentId}": {
+      "schema": "Investment",
+      "description": "Active and past investments"
+    },
+    "/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Deposit and withdrawal history"
+    }
+  }
+}
