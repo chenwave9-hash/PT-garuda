@@ -27,15 +27,22 @@ async function startServer() {
 
   // Log all requests
   app.use((req, res, next) => {
-    console.log(`${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
   });
 
+  // Health check
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', time: new Date().toISOString() });
+  });
+
   // --- Database Setup ---
+  console.log('Initializing database...');
   const db = await open({
     filename: './database.db',
     driver: sqlite3.Database
   });
+  console.log('Database opened successfully.');
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS users (

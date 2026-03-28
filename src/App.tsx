@@ -72,9 +72,20 @@ const fetchAPI = async (endpoint: string, options: any = {}) => {
   };
 
   const response = await fetch(endpoint, { ...options, headers });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || 'API request failed');
-  return data;
+  
+  const contentType = response.headers.get('content-type');
+  if (contentType && contentType.includes('application/json')) {
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.message || 'API request failed');
+    return data;
+  } else {
+    const text = await response.text();
+    if (!response.ok) {
+      // Try to extract error message from HTML if possible, or just show status
+      throw new Error(`Server error (${response.status}): ${text.slice(0, 100)}...`);
+    }
+    return text;
+  }
 };
 
 // --- Types ---
@@ -204,10 +215,14 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
         method: 'POST',
         body: JSON.stringify({ email, password: pass, displayName: name, phoneNumber: phone, referredBy: refCode })
       });
-      localStorage.setItem('token', data.token);
-      setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
-      setUserData(data.user);
-      toast.success('Account created successfully!');
+      if (data && data.token) {
+        localStorage.setItem('token', data.token);
+        setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
+        setUserData(data.user);
+        toast.success('Account created successfully!');
+      } else {
+        throw new Error('Invalid response from server');
+      }
     } catch (e: any) {
       toast.error(e.message || 'Registration failed');
     } finally {
