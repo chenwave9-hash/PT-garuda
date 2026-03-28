@@ -4,35 +4,7 @@
  */
 
 import React, { createContext, useContext, useEffect, useState, Component, ReactNode, useRef } from 'react';
-import { 
-  signOut, 
-  onAuthStateChanged, 
-  User as FirebaseUser,
-  createUserWithEmailAndPassword,
-  signInWithEmailAndPassword,
-  updateProfile,
-  signInWithPopup,
-  GoogleAuthProvider
-} from 'firebase/auth';
 import { Turnstile } from '@marsidev/react-turnstile';
-import { 
-  collection, 
-  doc, 
-  getDoc, 
-  setDoc, 
-  onSnapshot, 
-  query, 
-  where, 
-  updateDoc, 
-  addDoc, 
-  Timestamp, 
-  increment,
-  getDocs,
-  orderBy,
-  limit,
-  writeBatch
-} from 'firebase/firestore';
-import { auth, db, googleProvider } from './firebase';
 import { 
   Home,
   Briefcase,
@@ -91,6 +63,20 @@ const formatCurrency = (amount: number) => {
   }).format(amount);
 };
 
+const fetchAPI = async (endpoint: string, options: any = {}) => {
+  const token = localStorage.getItem('token');
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+    ...options.headers
+  };
+
+  const response = await fetch(endpoint, { ...options, headers });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || 'API request failed');
+  return data;
+};
+
 // --- Types ---
 interface UserData {
   uid: string;
@@ -105,7 +91,7 @@ interface UserData {
   referralCode: string;
   referredBy?: string;
   hasSeenReferralModal: boolean;
-  createdAt: Timestamp;
+  createdAt: string;
 }
 
 interface Investment {
@@ -115,10 +101,11 @@ interface Investment {
   amount: number;
   profitPct?: number;
   dailyProfit: number;
-  daysLeft: number;
-  totalDays: number;
+  startDate: string;
+  endDate: string;
   status: 'active' | 'completed';
-  lastProfitUpdate: Timestamp;
+  lastClaimDate: string;
+  totalEarned: number;
 }
 
 interface Transaction {
@@ -130,22 +117,31 @@ interface Transaction {
   netAmount?: number;
   status: 'pending' | 'approved' | 'rejected';
   method: string;
+  description?: string;
+  proofImage?: string;
+  createdAt: string;
   accountName?: string;
   accountNumber?: string;
-  proofURL?: string;
-  createdAt: Timestamp;
+}
+
+interface SupportChat {
+  id: string;
+  uid: string;
+  message: string;
+  sender: 'user' | 'admin';
+  createdAt: string;
 }
 
 // --- Context ---
 interface AuthContextType {
-  user: FirebaseUser | null;
+  user: { uid: string; email: string; role: string } | null;
   userData: UserData | null;
   loading: boolean;
   isAuthenticating: boolean;
   signIn: (email: string, pass: string) => Promise<void>;
-  signInWithGoogle: () => Promise<void>;
   signUp: (email: string, pass: string, name: string, phone: string, refCode?: string) => Promise<void>;
   logout: () => Promise<void>;
+  refreshUserData: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -157,48 +153,42 @@ const useAuth = () => {
 };
 
 const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [user, setUser] = useState<{ uid: string; email: string; role: string } | null>(null);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [loading, setLoading] = useState(true);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
-  const generateReferralCode = () => {
-    return Math.random().toString(36).substring(2, 8).toUpperCase();
+  const refreshUserData = async () => {
+    try {
+      const data = await fetchAPI('/api/auth/me');
+      setUserData(data);
+      setUser({ uid: data.uid, email: data.email, role: data.role });
+    } catch (err) {
+      setUser(null);
+      setUserData(null);
+      localStorage.removeItem('token');
+    }
   };
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (u) => {
-      setUser(u);
-      if (u) {
-        const docRef = doc(db, 'users', u.uid);
-        try {
-          const docSnap = await getDoc(docRef);
-          if (docSnap.exists()) {
-            setUserData(docSnap.data() as UserData);
-          }
-        } catch (err) {
-          handleFirestoreError(err, OperationType.GET, 'users/' + u.uid);
-        }
-
-        onSnapshot(docRef, (snap) => {
-          if (snap.exists()) {
-            setUserData(snap.data() as UserData);
-          }
-        }, (err) => {
-          handleFirestoreError(err, OperationType.GET, 'users/' + u.uid);
-        });
-      } else {
-        setUserData(null);
-      }
+    const token = localStorage.getItem('token');
+    if (token) {
+      refreshUserData().finally(() => setLoading(false));
+    } else {
       setLoading(false);
-    });
-    return () => unsub();
+    }
   }, []);
 
   const signIn = async (email: string, pass: string) => {
     setIsAuthenticating(true);
     try {
-      await signInWithEmailAndPassword(auth, email, pass);
+      const data = await fetchAPI('/api/auth/signin', {
+        method: 'POST',
+        body: JSON.stringify({ email, password: pass })
+      });
+      localStorage.setItem('token', data.token);
+      setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
+      setUserData(data.user);
       toast.success('Welcome back!');
     } catch (e: any) {
       toast.error(e.message || 'Login failed');
@@ -207,71 +197,16 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
     }
   };
 
-  const signInWithGoogle = async () => {
-    setIsAuthenticating(true);
-    try {
-      const result = await signInWithPopup(auth, googleProvider);
-      const u = result.user;
-      const docRef = doc(db, 'users', u.uid);
-      const docSnap = await getDoc(docRef);
-
-      if (!docSnap.exists()) {
-        const newData: UserData = {
-          uid: u.uid,
-          email: u.email || '',
-          displayName: u.displayName || 'User',
-          balance: 0,
-          role: u.email === 'chenwave9@gmail.com' ? 'admin' : 'user',
-          isBlocked: false,
-          photoURL: u.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(u.displayName || 'User')}&background=2563eb&color=fff`,
-          referralCode: generateReferralCode(),
-          hasSeenReferralModal: false,
-          createdAt: Timestamp.now()
-        };
-        await setDoc(docRef, newData);
-        setUserData(newData);
-      }
-      toast.success('Welcome!');
-    } catch (e: any) {
-      toast.error(e.message || 'Google Login failed');
-    } finally {
-      setIsAuthenticating(false);
-    }
-  };
-
   const signUp = async (email: string, pass: string, name: string, phone: string, refCode?: string) => {
     setIsAuthenticating(true);
     try {
-      const userCredential = await createUserWithEmailAndPassword(auth, email, pass);
-      const u = userCredential.user;
-      await updateProfile(u, { displayName: name });
-
-      let referredBy = '';
-      if (refCode) {
-        const q = query(collection(db, 'users'), where('referralCode', '==', refCode.toUpperCase()), limit(1));
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          referredBy = snap.docs[0].id;
-        }
-      }
-
-      const newData: UserData = {
-        uid: u.uid,
-        email: email,
-        displayName: name,
-        phoneNumber: phone,
-        balance: 0,
-        role: email === 'chenwave9@gmail.com' ? 'admin' : 'user',
-        isBlocked: false,
-        photoURL: `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=2563eb&color=fff`,
-        referralCode: generateReferralCode(),
-        referredBy: referredBy,
-        hasSeenReferralModal: true, // Already provided refCode or skipped during manual signup
-        createdAt: Timestamp.now()
-      };
-
-      await setDoc(doc(db, 'users', u.uid), newData);
-      setUserData(newData);
+      const data = await fetchAPI('/api/auth/signup', {
+        method: 'POST',
+        body: JSON.stringify({ email, password: pass, displayName: name, phoneNumber: phone, referredBy: refCode })
+      });
+      localStorage.setItem('token', data.token);
+      setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
+      setUserData(data.user);
       toast.success('Account created successfully!');
     } catch (e: any) {
       toast.error(e.message || 'Registration failed');
@@ -280,10 +215,15 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
     }
   };
 
-  const logout = () => signOut(auth);
+  const logout = async () => {
+    localStorage.removeItem('token');
+    setUser(null);
+    setUserData(null);
+    toast.success('Logged out');
+  };
 
   return (
-    <AuthContext.Provider value={{ user, userData, loading, isAuthenticating, signIn, signInWithGoogle, signUp, logout }}>
+    <AuthContext.Provider value={{ user, userData, loading, isAuthenticating, signIn, signUp, logout, refreshUserData }}>
       {children}
     </AuthContext.Provider>
   );
@@ -623,101 +563,50 @@ const AdminPanel = () => {
   const [loading, setLoading] = useState(true);
   const [selectedProof, setSelectedProof] = useState<string | null>(null);
 
+  const fetchAdminData = async () => {
+    try {
+      const usersData = await fetchAPI('/api/users');
+      setUsers(usersData);
+      
+      const txsData = await fetchAPI('/api/transactions');
+      setTransactions(txsData);
+      
+      setLoading(false);
+    } catch (err) {
+      console.error('Fetch admin data error:', err);
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-      setUsers(snap.docs.map(d => d.data() as UserData));
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'users'));
-    const unsubTx = onSnapshot(query(collection(db, 'transactions'), orderBy('createdAt', 'desc')), (snap) => {
-      setTransactions(snap.docs.map(d => ({ id: d.id, ...d.data() } as Transaction)));
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'transactions'));
-    setLoading(false);
-    return () => { unsubUsers(); unsubTx(); };
+    fetchAdminData();
+    const interval = setInterval(fetchAdminData, 10000);
+    return () => clearInterval(interval);
   }, []);
 
-  const handleStatus = async (txId: string, status: 'approved' | 'rejected', uid: string, amount: number, type: string) => {
+  const handleStatus = async (txId: string, status: 'approved' | 'rejected') => {
     try {
-      const batch = writeBatch(db);
-      const txRef = doc(db, 'transactions', txId);
-      const userRef = doc(db, 'users', uid);
-
-      // Fetch user data to check for referrer
-      const userSnap = await getDoc(userRef);
-      const userData = userSnap.data() as UserData;
-
-      batch.update(txRef, { status });
-
-      if (status === 'approved') {
-        if (type === 'deposit') {
-          const updates: any = { balance: increment(amount) };
-          
-          // VVIP Upgrade Logic (Min 100k balance or deposit)
-          if ((amount >= 100000 || (userData.balance + amount) >= 100000) && (!userData.vipLevel || userData.vipLevel < 1)) {
-            updates.vipLevel = 1;
-          }
-          
-          batch.update(userRef, updates);
-
-          // VVIP Cashback (20% for VVIP members on their own deposits)
-          if (userData?.vipLevel && userData.vipLevel >= 1) {
-            const cashbackAmount = Math.floor(amount * 0.2);
-            batch.update(userRef, { balance: increment(cashbackAmount) });
-            
-            const cashbackTxRef = doc(collection(db, 'transactions'));
-            batch.set(cashbackTxRef, {
-              uid: userData.uid,
-              amount: cashbackAmount,
-              type: 'deposit',
-              status: 'approved',
-              description: `VVIP Cashback (20%)`,
-              createdAt: Timestamp.now()
-            });
-          }
-
-          // Referral Reward (20% of deposit)
-          if (userData?.referredBy) {
-            const referrerRef = doc(db, 'users', userData.referredBy);
-            const rewardAmount = Math.floor(amount * 0.2);
-            
-            // If deposit is >= 100k, upgrade referrer to VVIP too
-            const referrerUpdates: any = { balance: increment(rewardAmount) };
-            if (amount >= 100000) {
-              referrerUpdates.vipLevel = 1;
-            }
-            
-            batch.update(referrerRef, referrerUpdates);
-            
-            // Create transaction record for referral reward
-            const rewardTxRef = doc(collection(db, 'transactions'));
-            batch.set(rewardTxRef, {
-              uid: userData.referredBy,
-              amount: rewardAmount,
-              type: 'deposit',
-              status: 'approved',
-              description: `Referral reward from ${userData.displayName}`,
-              createdAt: Timestamp.now()
-            });
-          }
-        } else {
-          // Withdrawal already deducted from balance on request
-        }
-      } else if (status === 'rejected' && type === 'withdraw') {
-        // Refund balance if withdrawal rejected
-        batch.update(userRef, { balance: increment(amount) });
-      }
-
-      await batch.commit();
+      await fetchAPI(`/api/transactions/${txId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status })
+      });
       toast.success(`Transaction ${status}`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'transactions/status');
+      fetchAdminData();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to update transaction status');
     }
   };
 
   const toggleBlock = async (uid: string, current: boolean) => {
     try {
-      await updateDoc(doc(db, 'users', uid), { isBlocked: !current });
+      await fetchAPI(`/api/users/${uid}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ isBlocked: !current })
+      });
       toast.success(current ? 'User unblocked' : 'User blocked');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/' + uid);
+      fetchAdminData();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to toggle block status');
     }
   };
 
@@ -728,19 +617,30 @@ const AdminPanel = () => {
       return;
     }
     try {
-      await updateDoc(doc(db, 'users', uid), { balance: increment(isAdd ? amount : -amount) });
+      const user = users.find(u => u.uid === uid);
+      if (!user) return;
+      const newBalance = isAdd ? user.balance + amount : user.balance - amount;
+      await fetchAPI(`/api/users/${uid}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ balance: newBalance })
+      });
       toast.success('Balance adjusted');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/' + uid);
+      fetchAdminData();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to adjust balance');
     }
   };
 
   const clearBalance = async (uid: string) => {
     try {
-      await updateDoc(doc(db, 'users', uid), { balance: 0 });
+      await fetchAPI(`/api/users/${uid}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ balance: 0 })
+      });
       toast.success('Balance cleared to 0');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/' + uid);
+      fetchAdminData();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to clear balance');
     }
   };
 
@@ -800,22 +700,22 @@ const AdminPanel = () => {
                   )}
                 </div>
                 <div className="flex gap-2">
-                  {t.proofURL && (
+                  {t.proofImage && (
                     <button 
-                      onClick={() => setSelectedProof(t.proofURL!)}
+                      onClick={() => setSelectedProof(t.proofImage!)}
                       className="p-2 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 rounded-xl transition-colors"
                     >
                       <HistoryIcon className="w-5 h-5" />
                     </button>
                   )}
                   <button 
-                    onClick={() => handleStatus(t.id, 'approved', t.uid, t.amount, t.type)}
+                    onClick={() => handleStatus(t.id, 'approved')}
                     className="p-2 bg-green-500/10 text-green-500 hover:bg-green-500/20 rounded-xl transition-colors"
                   >
                     <CheckCircle2 className="w-5 h-5" />
                   </button>
                   <button 
-                    onClick={() => handleStatus(t.id, 'rejected', t.uid, t.amount, t.type)}
+                    onClick={() => handleStatus(t.id, 'rejected')}
                     className="p-2 bg-red-500/10 text-red-500 hover:bg-red-500/20 rounded-xl transition-colors"
                   >
                     <XCircle className="w-5 h-5" />
@@ -882,64 +782,6 @@ const AdminPanel = () => {
 };
 
 // --- Error Handling ---
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId: string | undefined;
-    email: string | null | undefined;
-    emailVerified: boolean | undefined;
-    isAnonymous: boolean | undefined;
-    tenantId: string | null | undefined;
-    providerInfo: {
-      providerId: string;
-      displayName: string | null;
-      email: string | null;
-      photoUrl: string | null;
-    }[];
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData.map(provider => ({
-        providerId: provider.providerId,
-        displayName: provider.displayName,
-        email: provider.email,
-        photoUrl: provider.photoURL
-      })) || []
-    },
-    operationType,
-    path
-  }
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  
-  // Show toast to user
-  if (errInfo.error.includes('permission-denied')) {
-    toast.error('Gagal: Izin ditolak. Silakan hubungi admin.');
-  } else {
-    toast.error(`Error: ${errInfo.error}`);
-  }
-
-  throw new Error(JSON.stringify(errInfo));
-}
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -1008,30 +850,27 @@ const ReferralTab = () => {
   const [loading, setLoading] = useState(true);
   const [totalEarned, setTotalEarned] = useState(0);
 
-  useEffect(() => {
+  const fetchReferralData = async () => {
     if (!userData) return;
-    const q = query(collection(db, 'users'), where('referredBy', '==', userData.uid), limit(100));
-    const unsub = onSnapshot(q, (snap) => {
-      setReferrals(snap.docs.map(d => d.data() as UserData));
-      setLoading(false);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'users/referrals'));
-
-    // Calculate total earned from referral rewards
-    const qRewards = query(
-      collection(db, 'transactions'), 
-      where('uid', '==', userData.uid),
-      where('description', '>=', 'Referral reward'),
-      where('description', '<=', 'Referral reward\uf8ff')
-    );
-    const unsubRewards = onSnapshot(qRewards, (snap) => {
-      const total = snap.docs.reduce((acc, doc) => acc + (doc.data().amount || 0), 0);
+    try {
+      const refs = await fetchAPI('/api/users/referrals');
+      setReferrals(refs);
+      
+      const txs = await fetchAPI('/api/transactions');
+      const total = txs
+        .filter((tx: any) => tx.description?.startsWith('Referral reward'))
+        .reduce((acc: number, tx: any) => acc + (tx.amount || 0), 0);
       setTotalEarned(total);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'transactions/referral_rewards'));
+      
+      setLoading(false);
+    } catch (err) {
+      console.error('Fetch referral data error:', err);
+      setLoading(false);
+    }
+  };
 
-    return () => {
-      unsub();
-      unsubRewards();
-    };
+  useEffect(() => {
+    fetchReferralData();
   }, [userData]);
 
   const copyRefLink = () => {
@@ -1137,7 +976,7 @@ const HistoryTab = ({ transactions }: { transactions: Transaction[] }) => {
                   </div>
                   <div>
                     <p className="text-sm font-bold text-white capitalize">{t.type}</p>
-                    <p className="text-[10px] text-zinc-500">{t.createdAt.toDate().toLocaleString()}</p>
+                    <p className="text-[10px] text-zinc-500">{new Date(t.createdAt).toLocaleString()}</p>
                   </div>
                 </div>
                 <div className="text-right">
@@ -1685,27 +1524,30 @@ interface SupportMessage {
   senderId: string;
   senderName: string;
   text: string;
-  createdAt: Timestamp;
+  createdAt: string;
   isAdmin: boolean;
 }
 
 const SupportTab = () => {
-  const { user, userData } = useAuth();
-  const [messages, setMessages] = useState<SupportMessage[]>([]);
+  const { user } = useAuth();
+  const [messages, setMessages] = useState<SupportChat[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  const fetchMessages = async () => {
+    try {
+      const data = await fetchAPI('/api/support');
+      setMessages(data);
+    } catch (err) {
+      console.error('Fetch support error:', err);
+    }
+  };
+
   useEffect(() => {
     if (!user) return;
-    const q = query(
-      collection(db, 'support_chats'),
-      where('uid', '==', user.uid),
-      orderBy('createdAt', 'asc')
-    );
-    const unsub = onSnapshot(q, (snap) => {
-      setMessages(snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportMessage)));
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'support_chats'));
-    return unsub;
+    fetchMessages();
+    const interval = setInterval(fetchMessages, 5000);
+    return () => clearInterval(interval);
   }, [user]);
 
   useEffect(() => {
@@ -1715,19 +1557,16 @@ const SupportTab = () => {
   }, [messages]);
 
   const sendMessage = async () => {
-    if (!user || !userData || !newMessage.trim()) return;
+    if (!newMessage.trim()) return;
     try {
-      await addDoc(collection(db, 'support_chats'), {
-        uid: user.uid,
-        senderId: user.uid,
-        senderName: userData.displayName || 'User',
-        text: newMessage,
-        createdAt: Timestamp.now(),
-        isAdmin: false
+      await fetchAPI('/api/support', {
+        method: 'POST',
+        body: JSON.stringify({ message: newMessage })
       });
       setNewMessage('');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'support_chats');
+      fetchMessages();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to send message');
     }
   };
 
@@ -1758,17 +1597,17 @@ const SupportTab = () => {
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-zinc-950/30">
         {messages.map((msg) => (
-          <div key={msg.id} className={cn("flex flex-col", msg.isAdmin ? "items-start" : "items-end")}>
+          <div key={msg.id} className={cn("flex flex-col", msg.sender === 'admin' ? "items-start" : "items-end")}>
             <div className={cn(
               "max-w-[80%] p-4 rounded-2xl text-sm",
-              msg.isAdmin 
+              msg.sender === 'admin' 
                 ? "bg-zinc-800 text-white rounded-tl-none" 
                 : "bg-blue-600 text-white rounded-tr-none"
             )}>
-              {msg.text}
+              {msg.message}
             </div>
             <span className="text-[8px] text-zinc-600 mt-1 uppercase font-mono">
-              {msg.createdAt?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
           </div>
         ))}
@@ -1803,23 +1642,29 @@ const SupportTab = () => {
 };
 
 const SupportAdmin = () => {
-  const [chats, setChats] = useState<{[key: string]: SupportMessage[]}>({});
+  const [chats, setChats] = useState<{[key: string]: SupportChat[]}>({});
   const [selectedUid, setSelectedUid] = useState<string | null>(null);
   const [reply, setReply] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const q = query(collection(db, 'support_chats'), orderBy('createdAt', 'asc'));
-    const unsub = onSnapshot(q, (snap) => {
-      const grouped: {[key: string]: SupportMessage[]} = {};
-      snap.docs.forEach(d => {
-        const msg = { id: d.id, ...d.data() } as SupportMessage;
+  const fetchAllChats = async () => {
+    try {
+      const data = await fetchAPI('/api/support');
+      const grouped: {[key: string]: SupportChat[]} = {};
+      data.forEach((msg: SupportChat) => {
         if (!grouped[msg.uid]) grouped[msg.uid] = [];
         grouped[msg.uid].push(msg);
       });
       setChats(grouped);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'support_chats/admin'));
-    return unsub;
+    } catch (err) {
+      console.error('Fetch all chats error:', err);
+    }
+  };
+
+  useEffect(() => {
+    fetchAllChats();
+    const interval = setInterval(fetchAllChats, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -1831,17 +1676,14 @@ const SupportAdmin = () => {
   const sendReply = async () => {
     if (!selectedUid || !reply.trim()) return;
     try {
-      await addDoc(collection(db, 'support_chats'), {
-        uid: selectedUid,
-        senderId: 'admin',
-        senderName: 'Admin Support',
-        text: reply,
-        createdAt: Timestamp.now(),
-        isAdmin: true
+      await fetchAPI('/api/support', {
+        method: 'POST',
+        body: JSON.stringify({ message: reply, uid: selectedUid })
       });
       setReply('');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'support_chats');
+      fetchAllChats();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to send reply');
     }
   };
 
@@ -1862,10 +1704,10 @@ const SupportAdmin = () => {
                 )}
               >
                 <div className="flex justify-between items-start mb-1">
-                  <span className="text-xs font-bold text-white truncate max-w-[120px]">{lastMsg.senderName}</span>
-                  <span className="text-[8px] text-zinc-500">{lastMsg.createdAt?.toDate().toLocaleTimeString()}</span>
+                  <span className="text-xs font-bold text-white truncate max-w-[120px]">{uid}</span>
+                  <span className="text-[8px] text-zinc-500">{new Date(lastMsg.createdAt).toLocaleTimeString()}</span>
                 </div>
-                <p className="text-[10px] text-zinc-500 truncate">{lastMsg.text}</p>
+                <p className="text-[10px] text-zinc-500 truncate">{lastMsg.message}</p>
               </button>
             );
           })}
@@ -1876,17 +1718,17 @@ const SupportAdmin = () => {
         {selectedUid ? (
           <>
             <div className="p-4 border-b border-zinc-800 bg-zinc-900/50 flex justify-between items-center">
-              <span className="text-sm font-bold text-white">Chat with {chats[selectedUid][0].senderName}</span>
+              <span className="text-sm font-bold text-white">Chat with {selectedUid}</span>
               <span className="text-[10px] text-zinc-500 font-mono uppercase">{selectedUid}</span>
             </div>
             <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-zinc-950/30">
               {chats[selectedUid].map(msg => (
-                <div key={msg.id} className={cn("flex flex-col", msg.isAdmin ? "items-end" : "items-start")}>
+                <div key={msg.id} className={cn("flex flex-col", msg.sender === 'admin' ? "items-end" : "items-start")}>
                   <div className={cn(
                     "max-w-[80%] p-3 rounded-xl text-xs",
-                    msg.isAdmin ? "bg-blue-600 text-white rounded-tr-none" : "bg-zinc-800 text-white rounded-tl-none"
+                    msg.sender === 'admin' ? "bg-blue-600 text-white rounded-tr-none" : "bg-zinc-800 text-white rounded-tl-none"
                   )}>
-                    {msg.text}
+                    {msg.message}
                   </div>
                 </div>
               ))}
@@ -1922,7 +1764,7 @@ const SupportAdmin = () => {
 };
 
 const MainApp = () => {
-  const { user, userData, loading, isAuthenticating, logout } = useAuth();
+  const { user, userData, loading, isAuthenticating, logout, refreshUserData } = useAuth();
   const effectiveVip = (userData?.balance && userData.balance >= 100000) ? Math.max(userData.vipLevel || 0, 1) : (userData?.vipLevel || 0);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [investments, setInvestments] = useState<Investment[]>([]);
@@ -1949,90 +1791,87 @@ const MainApp = () => {
 
   const showReferralModal = userData && !userData.referredBy && !userData.hasSeenReferralModal;
 
+  const fetchData = async () => {
+    if (!user) return;
+    try {
+      const [txs, invs] = await Promise.all([
+        fetchAPI('/api/transactions'),
+        fetchAPI('/api/investments')
+      ]);
+      setTransactions(txs);
+      setInvestments(invs);
+    } catch (err) {
+      console.error('Fetch data error:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchData();
+      const interval = setInterval(fetchData, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [user]);
+
   const handleApplyReferral = async (code: string) => {
     if (!userData || !user) return;
     try {
-      const q = query(collection(db, 'users'), where('referralCode', '==', code.toUpperCase()), limit(1));
-      const snap = await getDocs(q);
-      if (snap.empty) {
+      const referrer = await fetchAPI(`/api/users/referral/${code}`);
+      if (!referrer) {
         toast.error('Kode referral tidak valid');
         return;
       }
-      const referrerId = snap.docs[0].id;
-      if (referrerId === user.uid) {
+      if (referrer.uid === user.uid) {
         toast.error('Tidak bisa menggunakan kode sendiri');
         return;
       }
-      await updateDoc(doc(db, 'users', user.uid), {
-        referredBy: referrerId,
-        hasSeenReferralModal: true
+      await fetchAPI(`/api/users/me`, {
+        method: 'PATCH',
+        body: JSON.stringify({ referredBy: referrer.uid, hasSeenReferralModal: true })
       });
       toast.success('Kode referral berhasil digunakan!');
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/referral');
+      refreshUserData();
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to apply referral');
     }
   };
 
   const handleCloseReferralModal = async () => {
     if (!user) return;
     try {
-      await updateDoc(doc(db, 'users', user.uid), {
-        hasSeenReferralModal: true
+      await fetchAPI(`/api/users/me`, {
+        method: 'PATCH',
+        body: JSON.stringify({ hasSeenReferralModal: true })
       });
+      refreshUserData();
     } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/referral_modal');
+      console.error('Error closing referral modal:', e);
     }
   };
-
-  // Data Listeners
-  useEffect(() => {
-    if (!user) {
-      setTransactions([]);
-      setInvestments([]);
-      return;
-    }
-
-    // Real-time transactions
-    const qTx = query(collection(db, 'transactions'), where('uid', '==', user.uid), orderBy('createdAt', 'desc'), limit(100));
-    const unsubTx = onSnapshot(qTx, (snap) => {
-      setTransactions(snap.docs.map(d => ({ id: d.id, ...d.data() } as Transaction)));
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'transactions'));
-
-    // Real-time investments
-    const qInv = query(collection(db, 'investments'), where('uid', '==', user.uid), limit(100));
-    const unsubInv = onSnapshot(qInv, (snap) => {
-      setInvestments(snap.docs.map(d => ({ id: d.id, ...d.data() } as Investment)));
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'investments'));
-
-    return () => {
-      unsubTx();
-      unsubInv();
-    };
-  }, [user]);
 
   // Periodic Profit Check
   useEffect(() => {
     if (user) {
-      checkAndAddProfit(user.uid);
-      const interval = setInterval(() => checkAndAddProfit(user.uid), 1000 * 60 * 10); // Every 10 mins
+      checkAndAddProfit();
+      const interval = setInterval(checkAndAddProfit, 1000 * 60 * 60); // Every hour
       return () => clearInterval(interval);
     }
   }, [user]);
 
-  // Automatic VVIP Upgrade Logic
-  useEffect(() => {
-    if (userData && userData.balance >= 100000 && (!userData.vipLevel || userData.vipLevel < 1)) {
-      console.log('Automatic VVIP Upgrade triggered for:', userData.uid);
-      updateDoc(doc(db, 'users', userData.uid), { vipLevel: 1 })
-        .then(() => {
-          toast.success('Selamat! Anda telah menjadi member VVIP!', {
-            icon: '🌟',
-            duration: 5000
-          });
-        })
-        .catch(e => console.error('Error upgrading to VVIP:', e));
+  const checkAndAddProfit = async () => {
+    if (!user) return;
+    try {
+      const result = await fetchAPI('/api/investments/claim', { method: 'POST' });
+      if (result.totalProfit > 0 || result.capitalReturn > 0) {
+        if (result.totalProfit > 0) toast.success(`Profit claimed: ${formatCurrency(result.totalProfit)}`, { icon: '⛏️' });
+        if (result.capitalReturn > 0) toast.success(`Capital returned: ${formatCurrency(result.capitalReturn)}`, { icon: '💰' });
+        refreshUserData();
+        fetchData();
+      }
+    } catch (err) {
+      console.error('Claim profit error:', err);
     }
-  }, [userData?.balance, userData?.vipLevel]);
+  };
 
   const handleUpdateProfile = async () => {
     if (!userData || !profileModal.name) {
@@ -2040,91 +1879,23 @@ const MainApp = () => {
       return;
     }
     try {
-      await updateDoc(doc(db, 'users', userData.uid), {
-        displayName: profileModal.name,
-        phoneNumber: profileModal.phone
+      await fetchAPI(`/api/users/me`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          displayName: profileModal.name,
+          phoneNumber: profileModal.phone
+        })
       });
       toast.success('Profile updated!');
       setProfileModal({ ...profileModal, isOpen: false });
-    } catch (e) {
-      handleFirestoreError(e, OperationType.UPDATE, 'users/' + userData.uid);
+      refreshUserData();
+    } catch (e: any) {
+      toast.error(e.message || 'Update failed');
     }
   };
 
-   const checkAndAddProfit = async (uid: string) => {
-    console.log('checkAndAddProfit checking for uid:', uid);
-    try {
-      const q = query(collection(db, 'investments'), where('uid', '==', uid), where('status', '==', 'active'));
-      const snap = await getDocs(q);
-      console.log(`Found ${snap.docs.length} active investments for profit check`);
-      
-      const now = new Date();
-      const batch = writeBatch(db);
-      let totalProfit = 0;
-      let capitalReturn = 0;
-      let updatedCount = 0;
-
-      snap.docs.forEach(d => {
-        const inv = d.data() as Investment;
-        const lastUpdate = inv.lastProfitUpdate.toDate();
-        const diffHours = (now.getTime() - lastUpdate.getTime()) / (1000 * 60 * 60);
-        console.log(`Investment ${d.id}: diffHours=${diffHours.toFixed(2)}, daysLeft=${inv.daysLeft}`);
-
-        if (diffHours >= 24) {
-          const daysToUpdate = Math.floor(diffHours / 24);
-          const actualDaysToUpdate = Math.min(daysToUpdate, inv.daysLeft);
-          
-          if (actualDaysToUpdate > 0) {
-            const dailyProfit = (inv.profitPct && inv.totalDays)
-              ? (inv.amount * inv.profitPct) / inv.totalDays 
-              : inv.dailyProfit;
-            
-            const profit = actualDaysToUpdate * dailyProfit;
-            const newDaysLeft = inv.daysLeft - actualDaysToUpdate;
-            const isCompleted = newDaysLeft <= 0;
-            
-            console.log(`Updating ${d.id}: profit=${profit}, newDaysLeft=${newDaysLeft}, isCompleted=${isCompleted}`);
-            
-            batch.update(d.ref, {
-              daysLeft: newDaysLeft,
-              status: isCompleted ? 'completed' : 'active',
-              lastProfitUpdate: Timestamp.now()
-            });
-            
-            totalProfit += profit;
-            if (isCompleted) {
-              capitalReturn += inv.amount;
-            }
-            updatedCount++;
-          }
-        }
-      });
-
-      if (updatedCount > 0) {
-        console.log(`Committing profit batch: totalProfit=${totalProfit}, capitalReturn=${capitalReturn}`);
-        batch.update(doc(db, 'users', uid), { balance: increment(totalProfit + capitalReturn) });
-        await batch.commit();
-        if (totalProfit > 0) {
-          toast.success(`Profit ditambahkan: ${formatCurrency(totalProfit)}`, { icon: '⛏️' });
-        }
-        if (capitalReturn > 0) {
-          toast.success(`Modal dikembalikan: ${formatCurrency(capitalReturn)}`, { icon: '💰' });
-        }
-      } else {
-        console.log('No profits to update at this time.');
-      }
-    } catch (err) {
-      console.error('checkAndAddProfit error:', err);
-      handleFirestoreError(err, OperationType.WRITE, 'investments/profit');
-    }
-  };
-
-   const handleInvest = async (plan: Plan, amount: number, duration: number, profitPct: number) => {
-    console.log('handleInvest called:', { plan, amount, duration, profitPct });
-    if (!userData) {
-      console.warn('handleInvest: No userData');
-      return;
-    }
+  const handleInvest = async (plan: Plan, amount: number, duration: number, profitPct: number) => {
+    if (!userData) return;
     if (userData.balance < amount) {
       toast.error('Saldo tidak mencukupi');
       return;
@@ -2139,37 +1910,24 @@ const MainApp = () => {
     }
 
     const loadingToast = toast.loading('Memulai investasi...');
-
     try {
-      const batch = writeBatch(db);
-      const invRef = doc(collection(db, 'investments'));
-      const userRef = doc(db, 'users', userData.uid);
-
-      const investmentData = {
-        uid: userData.uid,
-        planName: plan.name,
-        amount: amount,
-        profitPct: profitPct,
-        dailyProfit: (amount * profitPct) / duration,
-        daysLeft: duration,
-        totalDays: duration,
-        status: 'active',
-        lastProfitUpdate: Timestamp.now()
-      };
-      
-      console.log('Creating investment:', investmentData);
-      batch.set(invRef, investmentData);
-
-      batch.update(userRef, { balance: increment(-amount) });
-
-      await batch.commit();
-      console.log('Investment batch committed successfully');
+      await fetchAPI('/api/investments', {
+        method: 'POST',
+        body: JSON.stringify({
+          planId: plan.id,
+          planName: plan.name,
+          amount,
+          dailyProfit: (amount * profitPct) / duration,
+          durationDays: duration
+        })
+      });
       toast.dismiss(loadingToast);
       toast.success(`${plan.name} berhasil dimulai!`, { icon: '🚀' });
-    } catch (e) {
-      console.error('Investment error:', e);
+      refreshUserData();
+      fetchData();
+    } catch (e: any) {
       toast.dismiss(loadingToast);
-      handleFirestoreError(e, OperationType.WRITE, 'investments');
+      toast.error(e.message || 'Investment failed');
     }
   };
 
@@ -2181,28 +1939,26 @@ const MainApp = () => {
     }
 
     try {
-      const txRef = collection(db, 'transactions');
-      await addDoc(txRef, {
-        uid: userData.uid,
-        type,
-        amount,
-        fee: fee || 0,
-        netAmount: netAmount || amount,
-        status: 'pending',
-        method,
-        accountName: accountName || null,
-        accountNumber: accountNumber || null,
-        proofURL: proofURL || null,
-        createdAt: Timestamp.now()
+      await fetchAPI('/api/transactions', {
+        method: 'POST',
+        body: JSON.stringify({
+          type,
+          amount,
+          method,
+          description: accountName ? `${accountName} - ${accountNumber}` : '',
+          proofImage: proofURL
+        })
       });
-
+      
       if (type === 'withdraw') {
-        await updateDoc(doc(db, 'users', userData.uid), { balance: increment(-amount) });
+        // Optimistically update balance or just wait for refresh
+        refreshUserData();
       }
 
       toast.success(`${type === 'deposit' ? 'Deposit' : 'Withdrawal'} request sent!`);
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, 'transactions');
+      fetchData();
+    } catch (e: any) {
+      toast.error(e.message || 'Transaction failed');
     }
   };
 
@@ -2327,7 +2083,7 @@ const MainApp = () => {
                           </div>
                           <div>
                             <div className="text-sm font-bold text-white uppercase tracking-tight">{t.type}</div>
-                            <div className="text-[10px] text-zinc-500">{t.createdAt.toDate().toLocaleString()}</div>
+                            <div className="text-[10px] text-zinc-500">{new Date(t.createdAt).toLocaleString()}</div>
                           </div>
                         </div>
                         <div className="text-right">
