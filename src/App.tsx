@@ -50,6 +50,33 @@ import { Toaster, toast } from 'react-hot-toast';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
+import { 
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
+  updateProfile,
+  User as FirebaseUser
+} from 'firebase/auth';
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  collection, 
+  query, 
+  where, 
+  onSnapshot, 
+  addDoc, 
+  orderBy, 
+  limit,
+  Timestamp,
+  increment,
+  getDocs,
+  serverTimestamp
+} from 'firebase/firestore';
+import { auth, db } from './firebase';
+
 // --- Utils ---
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -61,31 +88,6 @@ const formatCurrency = (amount: number) => {
     currency: 'IDR',
     minimumFractionDigits: 0,
   }).format(amount);
-};
-
-const fetchAPI = async (endpoint: string, options: any = {}) => {
-  const token = localStorage.getItem('token');
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-    ...options.headers
-  };
-
-  const response = await fetch(endpoint, { ...options, headers });
-  
-  const contentType = response.headers.get('content-type');
-  if (contentType && contentType.includes('application/json')) {
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.message || 'API request failed');
-    return data;
-  } else {
-    const text = await response.text();
-    if (!response.ok) {
-      // Try to extract error message from HTML if possible, or just show status
-      throw new Error(`Server error (${response.status}): ${text.slice(0, 100)}...`);
-    }
-    return text;
-  }
 };
 
 // --- Types ---
@@ -117,6 +119,7 @@ interface Investment {
   status: 'active' | 'completed';
   lastClaimDate: string;
   totalEarned: number;
+  duration: number;
 }
 
 interface Transaction {
@@ -169,37 +172,42 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [loading, setLoading] = useState(true);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+        if (userDoc.exists()) {
+          const data = userDoc.data() as UserData;
+          setUserData(data);
+          setUser({ uid: firebaseUser.uid, email: firebaseUser.email!, role: data.role });
+        } else {
+          // Handle case where auth exists but doc doesn't (shouldn't happen with correct signup)
+          setUser(null);
+          setUserData(null);
+        }
+      } else {
+        setUser(null);
+        setUserData(null);
+      }
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
   const refreshUserData = async () => {
-    try {
-      const data = await fetchAPI('/api/auth/me');
-      setUserData(data);
-      setUser({ uid: data.uid, email: data.email, role: data.role });
-    } catch (err) {
-      setUser(null);
-      setUserData(null);
-      localStorage.removeItem('token');
+    if (user) {
+      const userDoc = await getDoc(doc(db, 'users', user.uid));
+      if (userDoc.exists()) {
+        setUserData(userDoc.data() as UserData);
+      }
     }
   };
-
-  useEffect(() => {
-    const token = localStorage.getItem('token');
-    if (token) {
-      refreshUserData().finally(() => setLoading(false));
-    } else {
-      setLoading(false);
-    }
-  }, []);
 
   const signIn = async (email: string, pass: string) => {
     setIsAuthenticating(true);
     try {
-      const data = await fetchAPI('/api/auth/signin', {
-        method: 'POST',
-        body: JSON.stringify({ email, password: pass })
-      });
-      localStorage.setItem('token', data.token);
-      setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
-      setUserData(data.user);
+      await signInWithEmailAndPassword(auth, email, pass);
       toast.success('Welcome back!');
     } catch (e: any) {
       toast.error(e.message || 'Login failed');
@@ -211,18 +219,39 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const signUp = async (email: string, pass: string, name: string, phone: string, refCode?: string) => {
     setIsAuthenticating(true);
     try {
-      const data = await fetchAPI('/api/auth/signup', {
-        method: 'POST',
-        body: JSON.stringify({ email, password: pass, displayName: name, phoneNumber: phone, referredBy: refCode })
-      });
-      if (data && data.token) {
-        localStorage.setItem('token', data.token);
-        setUser({ uid: data.user.uid, email: data.user.email, role: data.user.role });
-        setUserData(data.user);
-        toast.success('Account created successfully!');
-      } else {
-        throw new Error('Invalid response from server');
+      const userCredential = await createUserWithEmailAndPassword(auth, email, pass);
+      const firebaseUser = userCredential.user;
+      
+      const newUserData: UserData = {
+        uid: firebaseUser.uid,
+        email: email,
+        displayName: name,
+        phoneNumber: phone,
+        balance: 0,
+        role: 'user',
+        isBlocked: false,
+        photoURL: `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`,
+        referralCode: Math.random().toString(36).substring(2, 8).toUpperCase(),
+        referredBy: refCode || '',
+        hasSeenReferralModal: false,
+        createdAt: new Date().toISOString()
+      };
+
+      await setDoc(doc(db, 'users', firebaseUser.uid), newUserData);
+      
+      // If referred, update the referrer's count
+      if (refCode) {
+        const referrersQuery = query(collection(db, 'users'), where('referralCode', '==', refCode));
+        const referrerDocs = await getDocs(referrersQuery);
+        if (!referrerDocs.empty) {
+          const referrerDoc = referrerDocs.docs[0];
+          await updateDoc(doc(db, 'users', referrerDoc.id), {
+            referralCount: increment(1)
+          });
+        }
       }
+
+      toast.success('Account created successfully!');
     } catch (e: any) {
       toast.error(e.message || 'Registration failed');
     } finally {
@@ -231,10 +260,12 @@ const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   };
 
   const logout = async () => {
-    localStorage.removeItem('token');
-    setUser(null);
-    setUserData(null);
-    toast.success('Logged out');
+    try {
+      await signOut(auth);
+      toast.success('Logged out');
+    } catch (e: any) {
+      toast.error('Logout failed');
+    }
   };
 
   return (
@@ -580,11 +611,17 @@ const AdminPanel = () => {
 
   const fetchAdminData = async () => {
     try {
-      const usersData = await fetchAPI('/api/users');
-      setUsers(usersData);
+      // Fetch users
+      const usersQ = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
+      const usersSnapshot = await getDocs(usersQ);
+      const usersList = usersSnapshot.docs.map(doc => ({ ...doc.data(), uid: doc.id } as UserData));
+      setUsers(usersList);
       
-      const txsData = await fetchAPI('/api/transactions');
-      setTransactions(txsData);
+      // Fetch transactions
+      const txsQ = query(collection(db, 'transactions'), orderBy('createdAt', 'desc'));
+      const txsSnapshot = await getDocs(txsQ);
+      const txsList = txsSnapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Transaction));
+      setTransactions(txsList);
       
       setLoading(false);
     } catch (err) {
@@ -595,18 +632,38 @@ const AdminPanel = () => {
 
   useEffect(() => {
     fetchAdminData();
-    const interval = setInterval(fetchAdminData, 10000);
-    return () => clearInterval(interval);
+    // Real-time listeners for admin data
+    const unsubUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
+      const usersList = snapshot.docs.map(doc => ({ ...doc.data(), uid: doc.id } as UserData));
+      setUsers(usersList);
+    });
+
+    const unsubTxs = onSnapshot(collection(db, 'transactions'), (snapshot) => {
+      const txsList = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Transaction));
+      setTransactions(txsList);
+    });
+
+    return () => {
+      unsubUsers();
+      unsubTxs();
+    };
   }, []);
 
   const handleStatus = async (txId: string, status: 'approved' | 'rejected') => {
     try {
-      await fetchAPI(`/api/transactions/${txId}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status })
-      });
+      const tx = transactions.find(t => t.id === txId);
+      if (!tx) return;
+
+      await updateDoc(doc(db, 'transactions', txId), { status });
+
+      if (status === 'approved' && tx.type === 'deposit') {
+        await updateDoc(doc(db, 'users', tx.uid), {
+          balance: increment(tx.amount),
+          totalDeposited: increment(tx.amount)
+        });
+      }
+
       toast.success(`Transaction ${status}`);
-      fetchAdminData();
     } catch (e: any) {
       toast.error(e.message || 'Failed to update transaction status');
     }
@@ -614,12 +671,8 @@ const AdminPanel = () => {
 
   const toggleBlock = async (uid: string, current: boolean) => {
     try {
-      await fetchAPI(`/api/users/${uid}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ isBlocked: !current })
-      });
+      await updateDoc(doc(db, 'users', uid), { isBlocked: !current });
       toast.success(current ? 'User unblocked' : 'User blocked');
-      fetchAdminData();
     } catch (e: any) {
       toast.error(e.message || 'Failed to toggle block status');
     }
@@ -632,15 +685,10 @@ const AdminPanel = () => {
       return;
     }
     try {
-      const user = users.find(u => u.uid === uid);
-      if (!user) return;
-      const newBalance = isAdd ? user.balance + amount : user.balance - amount;
-      await fetchAPI(`/api/users/${uid}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ balance: newBalance })
+      await updateDoc(doc(db, 'users', uid), {
+        balance: increment(isAdd ? amount : -amount)
       });
       toast.success('Balance adjusted');
-      fetchAdminData();
     } catch (e: any) {
       toast.error(e.message || 'Failed to adjust balance');
     }
@@ -648,12 +696,8 @@ const AdminPanel = () => {
 
   const clearBalance = async (uid: string) => {
     try {
-      await fetchAPI(`/api/users/${uid}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ balance: 0 })
-      });
+      await updateDoc(doc(db, 'users', uid), { balance: 0 });
       toast.success('Balance cleared to 0');
-      fetchAdminData();
     } catch (e: any) {
       toast.error(e.message || 'Failed to clear balance');
     }
@@ -868,13 +912,17 @@ const ReferralTab = () => {
   const fetchReferralData = async () => {
     if (!userData) return;
     try {
-      const refs = await fetchAPI('/api/users/referrals');
+      const q = query(collection(db, 'users'), where('referredBy', '==', userData.uid));
+      const querySnapshot = await getDocs(q);
+      const refs = querySnapshot.docs.map(doc => doc.data() as UserData);
       setReferrals(refs);
       
-      const txs = await fetchAPI('/api/transactions');
-      const total = txs
-        .filter((tx: any) => tx.description?.startsWith('Referral reward'))
-        .reduce((acc: number, tx: any) => acc + (tx.amount || 0), 0);
+      const txQ = query(collection(db, 'transactions'), where('uid', '==', userData.uid));
+      const txSnapshot = await getDocs(txQ);
+      const total = txSnapshot.docs
+        .map(doc => doc.data() as Transaction)
+        .filter((tx: Transaction) => tx.description?.startsWith('Referral reward'))
+        .reduce((acc: number, tx: Transaction) => acc + (tx.amount || 0), 0);
       setTotalEarned(total);
       
       setLoading(false);
@@ -991,7 +1039,7 @@ const HistoryTab = ({ transactions }: { transactions: Transaction[] }) => {
                   </div>
                   <div>
                     <p className="text-sm font-bold text-white capitalize">{t.type}</p>
-                    <p className="text-[10px] text-zinc-500">{new Date(t.createdAt).toLocaleString()}</p>
+                    <p className="text-[10px] text-zinc-500">{new Date(t.createdAt).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</p>
                   </div>
                 </div>
                 <div className="text-right">
@@ -1549,37 +1597,33 @@ const SupportTab = () => {
   const [newMessage, setNewMessage] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const fetchMessages = async () => {
-    try {
-      const data = await fetchAPI('/api/support');
-      setMessages(data);
-    } catch (err) {
-      console.error('Fetch support error:', err);
-    }
-  };
-
   useEffect(() => {
     if (!user) return;
-    fetchMessages();
-    const interval = setInterval(fetchMessages, 5000);
-    return () => clearInterval(interval);
+    
+    const q = query(
+      collection(db, 'support_chats'),
+      where('uid', '==', user.uid),
+      orderBy('createdAt', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const msgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as SupportChat));
+      setMessages(msgs);
+    });
+
+    return () => unsubscribe();
   }, [user]);
 
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages]);
-
   const sendMessage = async () => {
-    if (!newMessage.trim()) return;
+    if (!newMessage.trim() || !user) return;
     try {
-      await fetchAPI('/api/support', {
-        method: 'POST',
-        body: JSON.stringify({ message: newMessage })
+      await addDoc(collection(db, 'support_chats'), {
+        uid: user.uid,
+        sender: 'user',
+        message: newMessage,
+        createdAt: new Date().toISOString()
       });
       setNewMessage('');
-      fetchMessages();
     } catch (e: any) {
       toast.error(e.message || 'Failed to send message');
     }
@@ -1662,41 +1706,30 @@ const SupportAdmin = () => {
   const [reply, setReply] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const fetchAllChats = async () => {
-    try {
-      const data = await fetchAPI('/api/support');
+  useEffect(() => {
+    const q = query(collection(db, 'support_chats'), orderBy('createdAt', 'asc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
       const grouped: {[key: string]: SupportChat[]} = {};
-      data.forEach((msg: SupportChat) => {
+      snapshot.docs.forEach((doc) => {
+        const msg = { id: doc.id, ...doc.data() } as SupportChat;
         if (!grouped[msg.uid]) grouped[msg.uid] = [];
         grouped[msg.uid].push(msg);
       });
       setChats(grouped);
-    } catch (err) {
-      console.error('Fetch all chats error:', err);
-    }
-  };
-
-  useEffect(() => {
-    fetchAllChats();
-    const interval = setInterval(fetchAllChats, 10000);
-    return () => clearInterval(interval);
+    });
+    return () => unsubscribe();
   }, []);
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [selectedUid, chats]);
 
   const sendReply = async () => {
     if (!selectedUid || !reply.trim()) return;
     try {
-      await fetchAPI('/api/support', {
-        method: 'POST',
-        body: JSON.stringify({ message: reply, uid: selectedUid })
+      await addDoc(collection(db, 'support_chats'), {
+        uid: selectedUid,
+        sender: 'admin',
+        message: reply,
+        createdAt: new Date().toISOString()
       });
       setReply('');
-      fetchAllChats();
     } catch (e: any) {
       toast.error(e.message || 'Failed to send reply');
     }
@@ -1806,44 +1839,59 @@ const MainApp = () => {
 
   const showReferralModal = userData && !userData.referredBy && !userData.hasSeenReferralModal;
 
-  const fetchData = async () => {
+  const fetchData = () => {
     if (!user) return;
-    try {
-      const [txs, invs] = await Promise.all([
-        fetchAPI('/api/transactions'),
-        fetchAPI('/api/investments')
-      ]);
-      setTransactions(txs);
-      setInvestments(invs);
-    } catch (err) {
-      console.error('Fetch data error:', err);
-    }
+    
+    const txQ = query(collection(db, 'transactions'), where('uid', '==', user.uid), orderBy('createdAt', 'desc'));
+    const invQ = query(collection(db, 'investments'), where('uid', '==', user.uid));
+
+    const unsubTx = onSnapshot(txQ, (snapshot) => {
+      setTransactions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Transaction)));
+    });
+
+    const unsubInv = onSnapshot(invQ, (snapshot) => {
+      setInvestments(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Investment)));
+    });
+
+    return () => {
+      unsubTx();
+      unsubInv();
+    };
   };
 
   useEffect(() => {
-    if (user) {
-      fetchData();
-      const interval = setInterval(fetchData, 30000);
-      return () => clearInterval(interval);
-    }
+    const cleanup = fetchData();
+    return () => cleanup && cleanup();
   }, [user]);
 
   const handleApplyReferral = async (code: string) => {
     if (!userData || !user) return;
     try {
-      const referrer = await fetchAPI(`/api/users/referral/${code}`);
-      if (!referrer) {
+      const q = query(collection(db, 'users'), where('referralCode', '==', code));
+      const querySnapshot = await getDocs(q);
+      
+      if (querySnapshot.empty) {
         toast.error('Kode referral tidak valid');
         return;
       }
-      if (referrer.uid === user.uid) {
+      
+      const referrerDoc = querySnapshot.docs[0];
+      const referrerData = referrerDoc.data() as UserData;
+
+      if (referrerData.uid === user.uid) {
         toast.error('Tidak bisa menggunakan kode sendiri');
         return;
       }
-      await fetchAPI(`/api/users/me`, {
-        method: 'PATCH',
-        body: JSON.stringify({ referredBy: referrer.uid, hasSeenReferralModal: true })
+
+      await updateDoc(doc(db, 'users', user.uid), {
+        referredBy: referrerData.uid,
+        hasSeenReferralModal: true
       });
+
+      await updateDoc(doc(db, 'users', referrerData.uid), {
+        referralCount: increment(1)
+      });
+
       toast.success('Kode referral berhasil digunakan!');
       refreshUserData();
     } catch (e: any) {
@@ -1854,9 +1902,8 @@ const MainApp = () => {
   const handleCloseReferralModal = async () => {
     if (!user) return;
     try {
-      await fetchAPI(`/api/users/me`, {
-        method: 'PATCH',
-        body: JSON.stringify({ hasSeenReferralModal: true })
+      await updateDoc(doc(db, 'users', user.uid), {
+        hasSeenReferralModal: true
       });
       refreshUserData();
     } catch (e) {
@@ -1871,35 +1918,93 @@ const MainApp = () => {
       const interval = setInterval(checkAndAddProfit, 1000 * 60 * 60); // Every hour
       return () => clearInterval(interval);
     }
-  }, [user]);
+  }, [user, investments]);
 
   const checkAndAddProfit = async () => {
-    if (!user) return;
-    try {
-      const result = await fetchAPI('/api/investments/claim', { method: 'POST' });
-      if (result.totalProfit > 0 || result.capitalReturn > 0) {
-        if (result.totalProfit > 0) toast.success(`Profit claimed: ${formatCurrency(result.totalProfit)}`, { icon: '⛏️' });
-        if (result.capitalReturn > 0) toast.success(`Capital returned: ${formatCurrency(result.capitalReturn)}`, { icon: '💰' });
-        refreshUserData();
-        fetchData();
+    if (!user || !userData || investments.length === 0) return;
+    
+    let totalProfit = 0;
+    let capitalReturn = 0;
+    const now = new Date();
+
+    for (const inv of investments) {
+      if (inv.status !== 'active') continue;
+
+      const startDate = new Date(inv.startDate);
+      const lastClaimed = inv.lastClaimDate ? new Date(inv.lastClaimDate) : startDate;
+      const diffMs = now.getTime() - lastClaimed.getTime();
+      const diffHours = diffMs / (1000 * 60 * 60);
+
+      if (diffHours >= 24) {
+        // Calculate how many 24h cycles have passed
+        const cycles = Math.floor(diffHours / 24);
+        if (cycles > 0) {
+          const profit = inv.dailyProfit * cycles;
+          totalProfit += profit;
+          
+          // Check if investment is completed
+          const endDate = new Date(inv.endDate);
+          const isCompleted = now >= endDate;
+          
+          if (isCompleted) {
+            capitalReturn += inv.amount;
+          }
+
+          // Update lastClaimDate to exactly 24h after the previous one to maintain the schedule
+          const nextClaimDate = new Date(lastClaimed.getTime() + (cycles * 24 * 60 * 60 * 1000));
+
+          await updateDoc(doc(db, 'investments', inv.id), {
+            status: isCompleted ? 'completed' : 'active',
+            lastClaimDate: nextClaimDate.toISOString(),
+            totalEarned: increment(profit)
+          });
+
+          // Add transaction for profit
+          await addDoc(collection(db, 'transactions'), {
+            uid: user.uid,
+            type: 'deposit',
+            amount: profit,
+            status: 'approved',
+            method: 'System',
+            description: `Profit from ${inv.planName}`,
+            createdAt: now.toISOString()
+          });
+
+          if (isCompleted) {
+            await addDoc(collection(db, 'transactions'), {
+              uid: user.uid,
+              type: 'deposit',
+              amount: inv.amount,
+              status: 'approved',
+              method: 'System',
+              description: `Capital return from ${inv.planName}`,
+              createdAt: now.toISOString()
+            });
+          }
+        }
       }
-    } catch (err) {
-      console.error('Claim profit error:', err);
+    }
+
+    if (totalProfit > 0 || capitalReturn > 0) {
+      await updateDoc(doc(db, 'users', user.uid), {
+        balance: increment(totalProfit + capitalReturn)
+      });
+      
+      if (totalProfit > 0) toast.success(`Profit claimed: ${formatCurrency(totalProfit)}`, { icon: '⛏️' });
+      if (capitalReturn > 0) toast.success(`Capital returned: ${formatCurrency(capitalReturn)}`, { icon: '💰' });
+      refreshUserData();
     }
   };
 
   const handleUpdateProfile = async () => {
-    if (!userData || !profileModal.name) {
+    if (!userData || !profileModal.name || !user) {
       toast.error('Name is required');
       return;
     }
     try {
-      await fetchAPI(`/api/users/me`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          displayName: profileModal.name,
-          phoneNumber: profileModal.phone
-        })
+      await updateDoc(doc(db, 'users', user.uid), {
+        displayName: profileModal.name,
+        phoneNumber: profileModal.phone
       });
       toast.success('Profile updated!');
       setProfileModal({ ...profileModal, isOpen: false });
@@ -1926,20 +2031,44 @@ const MainApp = () => {
 
     const loadingToast = toast.loading('Memulai investasi...');
     try {
-      await fetchAPI('/api/investments', {
-        method: 'POST',
-        body: JSON.stringify({
-          planId: plan.id,
-          planName: plan.name,
-          amount,
-          dailyProfit: (amount * profitPct) / duration,
-          durationDays: duration
-        })
+      const dailyProfit = (amount * profitPct) / 100;
+      const now = new Date();
+      const endDate = new Date(now.getTime() + (duration * 24 * 60 * 60 * 1000));
+
+      // Create investment
+      await addDoc(collection(db, 'investments'), {
+        uid: user.uid,
+        planName: plan.name,
+        amount,
+        dailyProfit,
+        duration,
+        status: 'active',
+        startDate: now.toISOString(),
+        endDate: endDate.toISOString(),
+        lastClaimDate: now.toISOString(),
+        totalEarned: 0
       });
+
+      // Update user balance
+      await updateDoc(doc(db, 'users', user.uid), {
+        balance: increment(-amount),
+        totalInvested: increment(amount)
+      });
+
+      // Add transaction
+      await addDoc(collection(db, 'transactions'), {
+        uid: user.uid,
+        type: 'investment',
+        amount,
+        status: 'approved',
+        method: 'Balance',
+        description: `Investment in ${plan.name}`,
+        createdAt: now.toISOString()
+      });
+
       toast.dismiss(loadingToast);
       toast.success(`${plan.name} berhasil dimulai!`, { icon: '🚀' });
       refreshUserData();
-      fetchData();
     } catch (e: any) {
       toast.dismiss(loadingToast);
       toast.error(e.message || 'Investment failed');
@@ -1954,24 +2083,30 @@ const MainApp = () => {
     }
 
     try {
-      await fetchAPI('/api/transactions', {
-        method: 'POST',
-        body: JSON.stringify({
-          type,
-          amount,
-          method,
-          description: accountName ? `${accountName} - ${accountNumber}` : '',
-          proofImage: proofURL
-        })
+      const now = new Date().toISOString();
+
+      // Create transaction
+      await addDoc(collection(db, 'transactions'), {
+        uid: user.uid,
+        type,
+        amount,
+        status: 'pending',
+        method,
+        description: accountName ? `${accountName} - ${accountNumber}` : '',
+        proofImage: proofURL || '',
+        createdAt: now
       });
-      
+
       if (type === 'withdraw') {
-        // Optimistically update balance or just wait for refresh
-        refreshUserData();
+        // Update user balance for withdrawal
+        await updateDoc(doc(db, 'users', user.uid), {
+          balance: increment(-amount),
+          totalWithdrawn: increment(amount)
+        });
       }
 
       toast.success(`${type === 'deposit' ? 'Deposit' : 'Withdrawal'} request sent!`);
-      fetchData();
+      refreshUserData();
     } catch (e: any) {
       toast.error(e.message || 'Transaction failed');
     }
@@ -2060,24 +2195,43 @@ const MainApp = () => {
                     Active Plans
                   </h3>
                   <div className="space-y-3">
-                    {investments.filter(i => i.status === 'active').map(i => (
-                      <div key={i.id} className="bg-zinc-800/30 border border-zinc-800/50 p-4 rounded-2xl">
-                        <div className="flex justify-between items-center mb-2">
-                          <span className="text-sm font-bold text-white">{i.planName}</span>
-                          <span className="text-[10px] font-mono text-blue-500 uppercase tracking-widest">{i.daysLeft} Days Left</span>
+                    {investments.filter(i => i.status === 'active').map(i => {
+                      const lastClaim = new Date(i.lastClaimDate);
+                      const nextClaim = new Date(lastClaim.getTime() + (24 * 60 * 60 * 1000));
+                      const now = new Date();
+                      const diffMs = nextClaim.getTime() - now.getTime();
+                      const progress = Math.max(0, Math.min(100, ((24 * 60 * 60 * 1000 - diffMs) / (24 * 60 * 60 * 1000)) * 100));
+                      
+                      const hoursLeft = Math.floor(diffMs / (1000 * 60 * 60));
+                      const minutesLeft = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+                      return (
+                        <div key={i.id} className="bg-zinc-800/30 border border-zinc-800/50 p-4 rounded-2xl">
+                          <div className="flex justify-between items-center mb-2">
+                            <div>
+                              <span className="text-sm font-bold text-white block">{i.planName}</span>
+                              <span className="text-[8px] text-zinc-500 font-mono">Started: {new Date(i.startDate).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' })}</span>
+                            </div>
+                            <div className="text-right">
+                              <span className="text-[10px] font-mono text-blue-500 uppercase tracking-widest block">
+                                {hoursLeft}h {minutesLeft}m Left
+                              </span>
+                              <span className="text-[8px] text-zinc-500">Next Profit: {nextClaim.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
+                            </div>
+                          </div>
+                          <div className="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-1">
+                            <div 
+                              className="bg-blue-500 h-full transition-all duration-1000" 
+                              style={{ width: `${progress}%` }}
+                            />
+                          </div>
+                          <div className="flex justify-between items-center text-[8px] font-mono text-zinc-600 uppercase">
+                            <span>Progress: {progress.toFixed(1)}%</span>
+                            <span>Daily: {formatCurrency(i.dailyProfit)}</span>
+                          </div>
                         </div>
-                        <div className="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden">
-                          <div 
-                            className="bg-blue-500 h-full transition-all duration-1000" 
-                            style={{ width: `${((i.totalDays - i.daysLeft) / i.totalDays) * 100}%` }}
-                          />
-                        </div>
-                        <div className="flex justify-between mt-2 text-[10px] text-zinc-500">
-                          <span>Progress</span>
-                          <span>{formatCurrency(i.dailyProfit)} / Day</span>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                     {investments.filter(i => i.status === 'active').length === 0 && (
                       <p className="text-zinc-500 text-sm text-center py-8">No active plans</p>
                     )}

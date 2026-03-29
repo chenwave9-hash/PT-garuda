@@ -1,0 +1,93 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and account information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "phoneNumber": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "balance": { "type": "number" },
+        "isBlocked": { "type": "boolean" },
+        "photoURL": { "type": "string" },
+        "vipLevel": { "type": "number" },
+        "referralCode": { "type": "string" },
+        "referredBy": { "type": "string" },
+        "referralCount": { "type": "number" },
+        "hasSeenReferralModal": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "balance", "referralCode", "createdAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Deposit, withdrawal, and investment records",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "type": { "type": "string", "enum": ["deposit", "withdraw", "investment"] },
+        "amount": { "type": "number" },
+        "fee": { "type": "number" },
+        "netAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "method": { "type": "string" },
+        "description": { "type": "string" },
+        "proofImage": { "type": "string" },
+        "accountName": { "type": "string" },
+        "accountNumber": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "type", "amount", "status", "createdAt"]
+    },
+    "Investment": {
+      "title": "Investment",
+      "description": "User investment records",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "planName": { "type": "string" },
+        "amount": { "type": "number" },
+        "dailyProfit": { "type": "number" },
+        "daysLeft": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "completed"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastClaimDate": { "type": "string", "format": "date-time" },
+        "totalEarned": { "type": "number" }
+      },
+      "required": ["uid", "planName", "amount", "status", "createdAt"]
+    },
+    "SupportChat": {
+      "title": "SupportChat",
+      "description": "Customer support messages",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "message": { "type": "string" },
+        "sender": { "type": "string", "enum": ["user", "admin"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "message", "sender", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Financial transactions"
+    },
+    "/investments/{investmentId}": {
+      "schema": "Investment",
+      "description": "User investments"
+    },
+    "/support_chats/{chatId}": {
+      "schema": "SupportChat",
+      "description": "Support messages"
+    }
+  }
+}

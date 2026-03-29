@@ -1,0 +1,120 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    // Collection: users
+    // Document ID: {uid}
+    // Fields: uid, email, displayName, phoneNumber, role, balance, isBlocked, photoURL, vipLevel, referralCode, referredBy, referralCount, hasSeenReferralModal, createdAt
+    //
+    // Collection: transactions
+    // Document ID: {transactionId}
+    // Fields: uid, type, amount, fee, netAmount, status, method, description, proofImage, accountName, accountNumber, createdAt
+    //
+    // Collection: investments
+    // Document ID: {investmentId}
+    // Fields: uid, planName, amount, dailyProfit, daysLeft, status, createdAt, lastClaimDate, totalEarned
+    //
+    // Collection: support_chats
+    // Document ID: {chatId}
+    // Fields: uid, message, sender, createdAt
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "chenwave9@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isValidUser(data) {
+      return hasRequiredFields(['uid', 'email', 'role', 'balance', 'referralCode', 'createdAt']) &&
+             data.uid is string &&
+             data.email is string &&
+             data.role in ['admin', 'user'] &&
+             data.balance is number &&
+             data.referralCode is string &&
+             data.createdAt is string;
+    }
+
+    function isValidTransaction(data) {
+      return hasRequiredFields(['uid', 'type', 'amount', 'status', 'createdAt']) &&
+             data.uid is string &&
+             data.type in ['deposit', 'withdraw', 'investment'] &&
+             data.amount is number &&
+             data.status in ['pending', 'approved', 'rejected'] &&
+             data.createdAt is string;
+    }
+
+    function isValidInvestment(data) {
+      return hasRequiredFields(['uid', 'planName', 'amount', 'status', 'createdAt']) &&
+             data.uid is string &&
+             data.planName is string &&
+             data.amount is number &&
+             data.status in ['active', 'completed'] &&
+             data.createdAt is string;
+    }
+
+    function isValidSupportChat(data) {
+      return hasRequiredFields(['uid', 'message', 'sender', 'createdAt']) &&
+             data.uid is string &&
+             data.message is string &&
+             data.sender in ['user', 'admin'] &&
+             data.createdAt is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isAuthenticated() && isValidUser(request.resource.data) && isOwner(uid);
+      allow update: if isAuthenticated() && (
+        (isOwner(uid) && isValidUser(request.resource.data) && request.resource.data.role == resource.data.role) || 
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /transactions/{transactionId} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidTransaction(request.resource.data) && request.resource.data.uid == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /investments/{investmentId} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidInvestment(request.resource.data) && request.resource.data.uid == request.auth.uid;
+      allow update: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /support_chats/{chatId} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidSupportChat(request.resource.data) && (request.resource.data.uid == request.auth.uid || isAdmin());
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
